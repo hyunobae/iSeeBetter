@@ -9,11 +9,12 @@ from data import get_training_set
 import logger
 from rbpn import Net as RBPN
 from rbpn import GeneratorLoss
-from SRGAN.model import Discriminator
+from SRGAN.PGD import Discriminator
 import torch.nn as nn
 from torch.autograd import Variable
 from torch.utils.data import DataLoader
 import utils
+import numpy as np
 
 ################################################## iSEEBETTER TRAINER KNOBS ############################################
 UPSCALE_FACTOR = 4
@@ -53,7 +54,16 @@ parser.add_argument('--kd2', type=int, default=42)
 parser.add_argument('--kd_range', type=int, default=3)
 parser.add_argument('--version', type=int, default=0)
 
-def trainModel(epoch, training_data_loader, netG, netD, optimizerD, optimizerG, generatorCriterion, device, args):
+
+def distill_loss(y, label, score, T, alpha):
+    return nn.KLDivLoss()(F.log_softmax(y / T),
+                          F.softmax(score / T)) * (T * T * 2.0 + alpha) + \
+           F.binary_cross_entropy(y, label) * (1 - alpha)
+
+
+def trainModel(epoch, training_data_loader, netG, netD, optimizerD, optimizerG, generatorCriterion, device, args, kd1,
+               kd2, kd_range, student, optimizerS):
+
     trainBar = tqdm(training_data_loader)
     runningResults = {'batchSize': 0, 'DLoss': 0, 'GLoss': 0, 'DScore': 0, 'GScore': 0}
 
@@ -63,6 +73,15 @@ def trainModel(epoch, training_data_loader, netG, netD, optimizerD, optimizerG, 
     # Skip first iteration
     iterTrainBar = iter(trainBar)
     next(iterTrainBar)
+    is_kd = 0
+
+    # if kd1 <= epoch < kd1 + kd_range or kd2 <= epoch < kd2 + kd_range:
+    #     print('kd phase')
+    #     netG.eval()
+    #     netD.eval()
+    #     student.train()
+    #     is_kd = 1
+
 
     for data in iterTrainBar:
         batchSize = len(data)
@@ -81,6 +100,8 @@ def trainModel(epoch, training_data_loader, netG, netD, optimizerD, optimizerG, 
 
         # Zero-out gradients, i.e., start afresh
         netD.zero_grad()
+        # if is_kd==1:
+        #     student.zero_grad()
 
         input, target, neigbor, flow, bicubic = data[0], data[1], data[2], data[3], data[4]
         if args.gpu_mode and torch.cuda.is_available():
@@ -103,6 +124,20 @@ def trainModel(epoch, training_data_loader, netG, netD, optimizerD, optimizerG, 
         realOut = netD(target).mean()
         fakeOut = netD(fakeHR).mean()
 
+        # if is_kd == 1:
+        #     srealOut = student(target).mean()
+        #     sfakeOut = student(fakeHR).mean()
+        #     one = torch.Tensor([0]).reshape(1)
+        #     one = one.cuda()
+        #
+        #     zero = torch.Tensor([0]).reshape(1)
+        #     zero = zero.cuda()
+        #
+        #     distill_real_loss = distill_loss(srealOut, one, realOut, 10, 0.5)
+        #     distill_fake_loss = distill_loss(sfakeOut, zero, fakeOut, 10, 0.5)
+        #
+        #     total_distill_loss = 0.3*distill_real_loss + 0.7*distill_fake_loss
+
         if args.APITLoss:
             fakeHRs.append(fakeHR)
             targets.append(target)
@@ -118,6 +153,9 @@ def trainModel(epoch, training_data_loader, netG, netD, optimizerD, optimizerG, 
 
         # Update weights
         optimizerD.step()
+        # if is_kd == 1:
+        #     total_distill_loss.backward()
+        #     optimizerS.step()
 
         ################################################################################################################
         # (2) Update G network: minimize 1-D(G(z)) + Perception Loss + Image Loss + TV Loss
@@ -154,7 +192,7 @@ def trainModel(epoch, training_data_loader, netG, netD, optimizerD, optimizerG, 
         runningResults['GScore'] += fakeOut.item() * args.batchSize
 
         trainBar.set_description(desc='[Epoch: %d/%d] D Loss: %.4f G Loss: %.4f D(x): %.4f D(G(z)): %.4f' %
-                                       (epoch, args.nEpochs, runningResults['DLoss'] / runningResults['batchSize'],
+                                      (epoch, args.nEpochs, runningResults['DLoss'] / runningResults['batchSize'],
                                        runningResults['GLoss'] / runningResults['batchSize'],
                                        runningResults['DScore'] / runningResults['batchSize'],
                                        runningResults['GScore'] / runningResults['batchSize']))
@@ -169,6 +207,7 @@ def trainModel(epoch, training_data_loader, netG, netD, optimizerD, optimizerG, 
         logger.info('Learning rate decay: lr=%s', (optimizerG.param_groups[0]['lr']))
 
     return runningResults
+
 
 def saveModelParams(epoch, runningResults, netG, netD):
     results = {'DLoss': [], 'GLoss': [], 'DScore': [], 'GScore': [], 'PSNR': [], 'SSIM': []}
@@ -185,20 +224,26 @@ def saveModelParams(epoch, runningResults, netG, netD):
     results['GLoss'].append(runningResults['GLoss'] / runningResults['batchSize'])
     results['DScore'].append(runningResults['DScore'] / runningResults['batchSize'])
     results['GScore'].append(runningResults['GScore'] / runningResults['batchSize'])
-    #results['PSNR'].append(validationResults['PSNR'])
-    #results['SSIM'].append(validationResults['SSIM'])
+    # results['PSNR'].append(validationResults['PSNR'])
+    # results['SSIM'].append(validationResults['SSIM'])
+    #
+    # if epoch % 1 == 0 and epoch != 0:
+    #     out_path = 'statistics/'
+    #     data_frame = pd.DataFrame(
+    #         data={'DLoss': results['DLoss'], 'GLoss': results['GLoss'], 'DScore': results['DScore'],
+    #               'GScore': results['GScore']},  # , 'PSNR': results['PSNR'], 'SSIM': results['SSIM']},
+    #         index=range(1, epoch + 1))
+    #     data_frame.to_csv(out_path + 'iSeeBetter_' + str(UPSCALE_FACTOR) + '_Train_Results.csv', index_label='Epoch')
 
-    if epoch % 1 == 0 and epoch != 0:
-        out_path = 'statistics/'
-        data_frame = pd.DataFrame(data={'DLoss': results['DLoss'], 'GLoss': results['GLoss'], 'DScore': results['DScore'],
-                                  'GScore': results['GScore']},#, 'PSNR': results['PSNR'], 'SSIM': results['SSIM']},
-                                  index=range(1, epoch + 1))
-        data_frame.to_csv(out_path + 'iSeeBetter_' + str(UPSCALE_FACTOR) + '_Train_Results.csv', index_label='Epoch')
 
 def main():
     """ Lets begin the training process! """
 
     args = parser.parse_args()
+    kd1 = args.kd1
+    kd2 = args.kd2
+    version = args.version
+    kd_range = args.kd_range
 
     # Initialize Logger
     logger.initLogger(args.debug)
@@ -222,7 +267,7 @@ def main():
         netG = torch.nn.DataParallel(netG, device_ids=gpus_list)
 
     # Use discriminator from SRGAN
-    netD = Discriminator()
+    netD = Discriminator(args)
     logger.info('# of Discriminator parameters: %s', sum(param.numel() for param in netD.parameters()))
 
     # Generator loss
@@ -259,10 +304,20 @@ def main():
         utils.loadPreTrainedModel(gpuMode=args.gpu_mode, model=netG, modelPath=modelPath)
 
     for epoch in range(args.start_epoch, args.nEpochs + 1):
-        runningResults = trainModel(epoch, training_data_loader, netG, netD, optimizerD, optimizerG, generatorCriterion, device, args)
+        if epoch == kd1 or epoch == kd2:
+            print('KD phase start')
+            args.version = args.version + 1
+            student = Discriminator(args)
+            optimizerStudent = optim.Adam(student.parameters(), lr=args.lr, betas=(0.9, 0.999), eps=1e-8)
+            student.cuda()
+            student.to(device)
+
+        runningResults = trainModel(epoch, training_data_loader, netG, netD, optimizerD, optimizerG, generatorCriterion,
+                                    device, args, kd1, kd2, kd_range, student, optimizerStudent)
 
         if (epoch + 1) % (args.snapshots) == 0:
             saveModelParams(epoch, runningResults, netG, netD)
+
 
 if __name__ == "__main__":
     main()
