@@ -1,6 +1,8 @@
 import argparse
 import gc
 import os
+import time
+
 import pandas as pd
 import torch.optim as optim
 import torch.utils.data
@@ -15,6 +17,7 @@ from torch.autograd import Variable
 from torch.utils.data import DataLoader
 import utils
 import numpy as np
+from torch.utils.tensorboard import writer
 
 ################################################## iSEEBETTER TRAINER KNOBS ############################################
 UPSCALE_FACTOR = 4
@@ -55,14 +58,13 @@ parser.add_argument('--kd_range', type=int, default=3)
 parser.add_argument('--version', type=int, default=0)
 
 
-def distill_loss(y, label, score, T, alpha):
-    return nn.KLDivLoss()(F.log_softmax(y / T),
-                          F.softmax(score / T)) * (T * T * 2.0 + alpha) + \
-           F.binary_cross_entropy(y, label) * (1 - alpha)
+# def distill_loss(y, label, score, T, alpha):
+#     return nn.KLDivLoss()(F.log_softmax(y / T),
+#                           F.softmax(score / T)) * (T * T * 2.0 + alpha) + \
+#            F.binary_cross_entropy(y, label) * (1 - alpha)
 
 
-def trainModel(epoch, training_data_loader, netG, netD, optimizerD, optimizerG, generatorCriterion, device, args, kd1,
-               kd2, kd_range, student, optimizerS):
+def trainModel(epoch, training_data_loader, netG, netD, optimizerD, optimizerG, generatorCriterion, device, args, writer):
 
     trainBar = tqdm(training_data_loader)
     runningResults = {'batchSize': 0, 'DLoss': 0, 'GLoss': 0, 'DScore': 0, 'GScore': 0}
@@ -200,6 +202,11 @@ def trainModel(epoch, training_data_loader, netG, netD, optimizerD, optimizerG, 
 
     netG.eval()
 
+    writer.add_scalar('loss/G_loss', runningResults['GLoss']/runningResults['batchSize'], epoch)
+    writer.add_scalar('loss/D_loss', runningResults['DLoss'] / runningResults['batchSize'], epoch)
+    writer.add_scalar('score/D(G(z))', runningResults['GScore'] / runningResults['batchSize'], epoch)
+    writer.add_scalar('score/D(x)', runningResults['GLoss'] / runningResults['batchSize'], epoch)
+
     # learning rate is decayed by a factor of 10 every half of total epochs
     if (epoch + 1) % (args.nEpochs / 2) == 0:
         for param_group in optimizerG.param_groups:
@@ -245,6 +252,7 @@ def main():
     version = args.version
     kd_range = args.kd_range
 
+    writer = torch.utils.tensorboard.writer.SummaryWriter('runs/')
     # Initialize Logger
     logger.initLogger(args.debug)
 
@@ -274,7 +282,7 @@ def main():
     generatorCriterion = nn.L1Loss() if not args.APITLoss else GeneratorLoss()
 
     # Specify device
-    device = torch.device("cuda:0" if torch.cuda.is_available() and args.gpu_mode else "cpu")
+    device = torch.device("cuda:1" if torch.cuda.is_available() and args.gpu_mode else "cpu")
 
     if args.gpu_mode and torch.cuda.is_available():
         utils.printCUDAStats()
@@ -303,20 +311,26 @@ def main():
         modelPath = os.path.join(args.save_folder + args.pretrained_sr)
         utils.loadPreTrainedModel(gpuMode=args.gpu_mode, model=netG, modelPath=modelPath)
 
+
+
+    start = time.time()
     for epoch in range(args.start_epoch, args.nEpochs + 1):
         if epoch == kd1 or epoch == kd2:
             print('KD phase start')
             args.version = args.version + 1
             student = Discriminator(args)
-            optimizerStudent = optim.Adam(student.parameters(), lr=args.lr, betas=(0.9, 0.999), eps=1e-8)
-            student.cuda()
-            student.to(device)
+            netD = student
+            netD.cuda()
+            netD.to(device)
 
-        runningResults = trainModel(epoch, training_data_loader, netG, netD, optimizerD, optimizerG, generatorCriterion,
-                                    device, args, kd1, kd2, kd_range, student, optimizerStudent)
+        runningResults = trainModel(epoch, training_data_loader, netG, netD, optimizerD, optimizerG, generatorCriterion, device, args, writer)
 
         if (epoch + 1) % (args.snapshots) == 0:
             saveModelParams(epoch, runningResults, netG, netD)
+
+
+    end = time.time()
+    print('Training end: ', end-start)
 
 
 if __name__ == "__main__":
