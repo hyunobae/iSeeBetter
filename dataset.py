@@ -69,11 +69,14 @@ def load_img_future(filepath, nFrames, scale, other_dataset, upscale_only):
         if nFrames%2 == 0:
             seq = [x for x in range(-tt,tt) if x!=0] # or seq = [x for x in range(-tt+1,tt+1) if x!=0]
         else:
-            seq = [x for x in range(-tt,tt+1) if x!=0]
+            seq = [x for x in range(-tt,tt+1) if x!=0] # -3~ center ~ +3까지다. hr0~2 and 끝 3개 어떻게 처리할것인가
         #random.shuffle(seq) #if random sequence
         for i in seq:
-            index1 = int(filepath[char_len-7:char_len-4])+i
-            file_name1=filepath[0:char_len-7]+'{0:03d}'.format(index1)+'.png'
+            name = filepath[:-4]
+            location = name.find('/hr')
+            name = name[location+3:]
+            index1 = int(name)+i # 현재 frame의 -3 ~ +3까지
+            file_name1=filepath[0:location+3]+'{0:d}'.format(index1)+'.png'
             
             if os.path.exists(file_name1):
                 if upscale_only:
@@ -185,11 +188,18 @@ def rescale_img(img_in, scale):
     img_in = img_in.resize(new_size_in, resample=Image.BICUBIC)
     return img_in
 
-class DatasetFromFolder(data.Dataset):
+class DatasetFromFolder(data.Dataset): # imagedir / file_list / other_dataset
     def __init__(self, image_dir,nFrames, upscale_factor, data_augmentation, file_list, other_dataset, patch_size, future_frame, transform=None):
         super(DatasetFromFolder, self).__init__()
-        alist = [line.rstrip() for line in open(join(image_dir,file_list))]
-        self.image_filenames = [join(image_dir,x) for x in alist]
+        alist = []
+        self.dirlist = os.listdir(image_dir)
+
+        # alist = [line.rstrip() for line in open(join(image_dir,file_list))]
+        self.image_filenames = []
+        self.dir_imagecnt = []
+        self.dircnt = 0
+
+
         self.nFrames = nFrames
         self.upscale_factor = upscale_factor
         self.transform = transform
@@ -198,9 +208,26 @@ class DatasetFromFolder(data.Dataset):
         self.patch_size = patch_size
         self.future_frame = future_frame
 
+        self.idx = 0
+
+        for filedir in self.dirlist:
+            for img in os.listdir(filedir):
+                self.image_filenames.append(image_dir + '/' + filedir + '/' + img)
+            self.dir_imagecnt.append(len(os.listdir(filedir)))
+            self.image_filenames.sort(key=lambda x:x[:-4])
+
+
+
     def __getitem__(self, index):
+        self.idx += 3
         if self.future_frame:
-            target, input, neigbor = load_img_future(self.image_filenames[index], self.nFrames, self.upscale_factor, self.other_dataset)
+            name = self.image_filenames[self.idx][:-4]
+            hridx = name.find('/hr')
+            name = int(name[hridx+2:])
+            if name>self.dir_imagecnt[self.dircnt]-3 and len(self.dir_imagecnt) < self.dircnt :
+                self.idx += 7
+                self.dircnt += 1
+                target, input, neigbor = load_img_future(self.image_filenames[self.idx], self.nFrames, self.upscale_factor, self.other_dataset)
         else:
             target, input, neigbor = load_img(self.image_filenames[index], self.nFrames, self.upscale_factor, self.other_dataset)
 
@@ -224,7 +251,7 @@ class DatasetFromFolder(data.Dataset):
         return input, target, neigbor, flow, bicubic
 
     def __len__(self):
-        return len(self.image_filenames)
+        return len(self.image_filenames) - len(os.listdir(self.dirlist))*6
 
 class DatasetFromFolderTest(data.Dataset):
     def __init__(self, image_dir, nFrames, upscale_factor, file_list, other_dataset, future_frame, transform=None, upscale_only=False):
@@ -239,6 +266,7 @@ class DatasetFromFolderTest(data.Dataset):
         self.upscale_only = upscale_only
 
     def __getitem__(self, index):
+        index += 3
         if self.future_frame:
             target, input, neigbor = load_img_future(self.image_filenames[index], self.nFrames, self.upscale_factor, self.other_dataset, self.upscale_only)
         else:
@@ -258,4 +286,4 @@ class DatasetFromFolderTest(data.Dataset):
         return input, target, neigbor, flow, bicubic
       
     def __len__(self):
-        return len(self.image_filenames)
+        return len(self.image_filenames) -
